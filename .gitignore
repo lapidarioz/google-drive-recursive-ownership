@@ -54,3 +54,10 @@ docs/_build/
 target/
 
 client_secrets.json
+
+# PyBuilder
+target/	target/
+
+ # IDE
+.vscode
+.idea
