@@ -2,24 +2,26 @@
 from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
-import httplib2
-import googleapiclient.discovery
-import googleapiclient.http
-import googleapiclient.errors
-import oauth2client.client
-import sys
-import pprint
 import os
-import webbrowser
-from ownership import grant_ownership
+import pprint
+import sys
 import time
-from rq import Queue
-from redis import Redis
+import webbrowser
 
+import googleapiclient.discovery
+import googleapiclient.errors
+import googleapiclient.http
+import httplib2
+import oauth2client.client
+from redis import Redis
+from rq import Queue
+
+from ownership import grant_ownership
 
 async_results = {}
 redis_conn = Redis()
 q = Queue(connection=redis_conn)
+r = Redis(host='localhost', port=6379, db=1)
 
 
 def get_drive_service():
@@ -78,19 +80,22 @@ def process_all_files(service, callback=None, callback_args=None, minimum_prefix
             children = service.children().list(folderId=folder_id, **param).execute()
             for child in children.get('items', []):
                 item = service.files().get(fileId=child['id']).execute()
-                # pprint.pprint(item)
+                #pprint.pprint(item)
                 if item['kind'] == 'drive#file':
                     if current_prefix[:len(minimum_prefix)] == minimum_prefix:
                         print(u'File: {} ({}, {})'.format(item['title'], current_prefix, item['id']))
                         # callback(service, item, current_prefix, **callback_args)
                         q.enqueue(callback, args=(service, item, current_prefix), kwargs=callback_args)
                     if item['mimeType'] == 'application/vnd.google-apps.folder':
-                        print(u'Folder: {} ({}, {})'.format(item['title'], current_prefix, item['id']))
-                        next_prefix = current_prefix + [item['title']]
-                        comparison_length = min(len(next_prefix), len(minimum_prefix))
+                        if r.get(item['id']) is None:  # already finished
+                            print(u'Folder: {} ({}, {})'.format(item['title'], current_prefix, item['id']))
+                            next_prefix = current_prefix + [item['title']]
+                            comparison_length = min(len(next_prefix), len(minimum_prefix))
 
-                        if minimum_prefix[:comparison_length] == next_prefix[:comparison_length]:
-                            process_all_files(service, callback, callback_args, minimum_prefix, next_prefix, item['id'])
+                            if minimum_prefix[:comparison_length] == next_prefix[:comparison_length]:
+                                process_all_files(service, callback, callback_args, minimum_prefix, next_prefix,
+                                                  item['id'])
+                                r.set(item['id'], 1)  # marked as finished
             page_token = children.get('nextPageToken')
             if not page_token:
                 break
