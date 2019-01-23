@@ -1,4 +1,6 @@
 #!/usr/bin/python
+from __future__ import (absolute_import, division, print_function,
+                        unicode_literals)
 
 import httplib2
 import googleapiclient.discovery
@@ -9,6 +11,16 @@ import sys
 import pprint
 import os
 import webbrowser
+from ownership import grant_ownership
+import time
+from rq import Queue
+from redis import Redis
+
+
+async_results = {}
+redis_conn = Redis()
+q = Queue(connection=redis_conn)
+
 
 def get_drive_service():
     OAUTH2_SCOPE = 'https://www.googleapis.com/auth/drive'
@@ -46,48 +58,6 @@ def show_info(service, drive_item, prefix, permission_id):
         pprint.pprint(drive_item)
 
 
-def grant_ownership(service, drive_item, prefix, permission_id, show_already_owned):
-    full_path = os.path.join(os.path.sep.join(prefix), drive_item['title']).encode('utf-8', 'replace')
-
-    # pprint.pprint(drive_item)
-
-    current_user_owns = False
-    for owner in drive_item['owners']:
-        if owner['permissionId'] == permission_id:
-            if show_already_owned:
-                print('Item {} already has the right owner.'.format(full_path))
-            return
-        elif owner['isAuthenticatedUser']:
-            current_user_owns = True
-
-    print('Item {} needs ownership granted.'.format(full_path))
-
-    if not current_user_owns:
-        print('    But, current user does not own the item.'.format(full_path))
-        return
-
-    try:
-        permission = service.permissions().get(fileId=drive_item['id'], permissionId=permission_id).execute()
-        permission['role'] = 'owner'
-        print('    Upgrading existing permissions to ownership.')
-        return service.permissions().update(fileId=drive_item['id'], permissionId=permission_id, body=permission,
-                                            transferOwnership=True).execute()
-    except googleapiclient.errors.HttpError as e:
-        if e.resp.status != 404:
-            print('An error occurred updating ownership permissions: {}'.format(e))
-            return
-
-    print('    Creating new ownership permissions.')
-    permission = {'role': 'owner',
-                  'type': 'user',
-                  'id': permission_id}
-    try:
-        service.permissions().insert(fileId=drive_item['id'], body=permission,
-                                     emailMessage='Automated recursive transfer of ownership.').execute()
-    except googleapiclient.errors.HttpError as e:
-        print('An error occurred inserting ownership permissions: {}'.format(e))
-
-
 def process_all_files(service, callback=None, callback_args=None, minimum_prefix=None, current_prefix=None,
                       folder_id='root'):
     if minimum_prefix is None:
@@ -112,11 +82,13 @@ def process_all_files(service, callback=None, callback_args=None, minimum_prefix
                 if item['kind'] == 'drive#file':
                     if current_prefix[:len(minimum_prefix)] == minimum_prefix:
                         print(u'File: {} ({}, {})'.format(item['title'], current_prefix, item['id']))
-                        callback(service, item, current_prefix, **callback_args)
+                        # callback(service, item, current_prefix, **callback_args)
+                        q.enqueue(callback, args=(service, item, current_prefix), kwargs=callback_args)
                     if item['mimeType'] == 'application/vnd.google-apps.folder':
                         print(u'Folder: {} ({}, {})'.format(item['title'], current_prefix, item['id']))
                         next_prefix = current_prefix + [item['title']]
                         comparison_length = min(len(next_prefix), len(minimum_prefix))
+
                         if minimum_prefix[:comparison_length] == next_prefix[:comparison_length]:
                             process_all_files(service, callback, callback_args, minimum_prefix, next_prefix, item['id'])
             page_token = children.get('nextPageToken')
@@ -125,6 +97,24 @@ def process_all_files(service, callback=None, callback_args=None, minimum_prefix
         except googleapiclient.errors.HttpError as e:
             print('An error occurred: {}'.format(e))
             break
+
+
+def check_remaining():
+    start_time = time.time()
+    i = 0
+    total = len(async_results)
+    while i < total:
+        os.system('clear')
+        print('All jobs are enqueued.')
+        print('Asynchronously: (now = %.2f)' % (time.time() - start_time,))
+        for result in async_results:
+            value = result.return_value
+            if value is not None:
+                i += 1
+        print('{} of {} completed.'.format(i, total))
+        time.sleep(0.2)
+
+    print('Done')
 
 
 if __name__ == '__main__':
@@ -143,5 +133,7 @@ if __name__ == '__main__':
     permission_id = get_permission_id_for_email(service, new_owner)
     print('User {} is permission ID {}.'.format(new_owner, permission_id))
     process_all_files(service, grant_ownership,
-                      {'permission_id': permission_id, 'show_already_owned': show_already_owned}, minimum_prefix_split)
+                      {'permission_id': permission_id, 'show_already_owned': show_already_owned},
+                      minimum_prefix_split)
+    check_remaining()
     # print(files)
