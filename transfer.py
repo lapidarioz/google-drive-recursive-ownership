@@ -5,7 +5,6 @@ from __future__ import (absolute_import, division, print_function,
 import os
 import pprint
 import sys
-import time
 import webbrowser
 
 import googleapiclient.discovery
@@ -13,18 +12,12 @@ import googleapiclient.errors
 import googleapiclient.http
 import httplib2
 import oauth2client.client
-from redis import Redis
-from rq import Queue
 
+from external import Storage
 from ownership import grant_ownership
 
-async_results = {}
-redis_conn = Redis()
-q = Queue(connection=redis_conn)
-r = Redis(host='localhost', port=6379, db=1)
 
-
-def get_drive_service():
+def get_drive_credentials():
     OAUTH2_SCOPE = 'https://www.googleapis.com/auth/drive'
     CLIENT_SECRETS = 'client_secrets.json'
     flow = oauth2client.client.flow_from_clientsecrets(CLIENT_SECRETS, OAUTH2_SCOPE)
@@ -36,11 +29,13 @@ def get_drive_service():
         code = input('Verification code: ').strip()
     else:
         code = raw_input('Verification code: ').strip()
-    credentials = flow.step2_exchange(code)
+    return flow.step2_exchange(code)
+
+
+def get_drive_service(credentials):
     http = httplib2.Http()
     credentials.authorize(http)
-    drive_service = googleapiclient.discovery.build('drive', 'v2', http=http)
-    return drive_service
+    return googleapiclient.discovery.build('drive', 'v2', http=http)
 
 
 def get_permission_id_for_email(service, email):
@@ -80,13 +75,15 @@ def process_all_files(service, callback=None, callback_args=None, minimum_prefix
             children = service.children().list(folderId=folder_id, **param).execute()
             for child in children.get('items', []):
                 item = service.files().get(fileId=child['id']).execute()
-                #pprint.pprint(item)
+                # pprint.pprint(item)
                 if item['kind'] == 'drive#file':
                     if current_prefix[:len(minimum_prefix)] == minimum_prefix:
                         print(u'File: {} ({}, {})'.format(item['title'], current_prefix, item['id']))
                         # callback(service, item, current_prefix, **callback_args)
+                        q = Storage.instance().queue
                         q.enqueue(callback, args=(service, item, current_prefix), kwargs=callback_args)
                     if item['mimeType'] == 'application/vnd.google-apps.folder':
+                        r = Storage.instance().redis
                         if r.get(item['id']) is None:  # already finished
                             print(u'Folder: {} ({}, {})'.format(item['title'], current_prefix, item['id']))
                             next_prefix = current_prefix + [item['title']]
@@ -104,41 +101,10 @@ def process_all_files(service, callback=None, callback_args=None, minimum_prefix
             break
 
 
-def check_remaining():
-    start_time = time.time()
-    i = 0
-    total = len(async_results)
-    while i < total:
-        os.system('clear')
-        print('All jobs are enqueued.')
-        print('Asynchronously: (now = %.2f)' % (time.time() - start_time,))
-        for result in async_results:
-            value = result.return_value
-            if value is not None:
-                i += 1
-        print('{} of {} completed.'.format(i, total))
-        time.sleep(0.2)
-
-    print('Done')
-
-
-if __name__ == '__main__':
-    if sys.version_info[0] > 2:
-        minimum_prefix = sys.argv[1]
-        new_owner = sys.argv[2]
-        show_already_owned = False if len(sys.argv) > 3 and sys.argv[3] == 'false' else True
-    else:
-        minimum_prefix = sys.argv[1].decode('utf-8')
-        new_owner = sys.argv[2].decode('utf-8')
-        show_already_owned = False if len(sys.argv) > 3 and sys.argv[3].decode('utf-8') == 'false' else True
-    print('Changing all files at path "{}" to owner "{}"'.format(minimum_prefix, new_owner))
-    minimum_prefix_split = minimum_prefix.split(os.path.sep)
-    print('Prefix: {}'.format(minimum_prefix_split))
-    service = get_drive_service()
+def run(credentials, minimum_prefix, new_owner, show_already_owned):
+    service = get_drive_service(credentials)
     permission_id = get_permission_id_for_email(service, new_owner)
     print('User {} is permission ID {}.'.format(new_owner, permission_id))
     process_all_files(service, grant_ownership,
                       {'permission_id': permission_id, 'show_already_owned': show_already_owned},
-                      minimum_prefix_split)
-    check_remaining()
-    # print(files)
+                      minimum_prefix)
