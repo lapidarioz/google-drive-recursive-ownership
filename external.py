@@ -7,7 +7,7 @@ class Storage:
 
     def __init__(self):
         redis_conn = Redis()
-        self.queue = Queue(connection=redis_conn)
+        self.queue = Queue(connection=redis_conn, default_timeout='10d')
         self.redis = Redis(host='localhost', port=6379, db=1)
 
     @staticmethod
